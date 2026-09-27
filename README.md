@@ -16,9 +16,6 @@
   </a>
 </p>
 
-
-# AlwaysOnTop
-
 > A fast, Python utility to force active windows to always stay on top without breaking active application sessions.
 
 > [!IMPORTANT]
