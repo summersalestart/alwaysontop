@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlwaysOnTop</title>
+  <link rel="stylesheet" href="./src/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-window">
+    <header class="titlebar">
+      <span class="titlebar-title">AlwaysOnTop</span>
+      <div class="titlebar-controls">
+        <button
+          id="btn-minimize"
+          class="control-btn control-minimize"
+          type="button"
+          aria-label="Minimize window"
+          title="Minimize"
+        ></button>
+        <button
+          id="btn-close"
+          class="control-btn control-close"
+          type="button"
+          aria-label="Close window"
+          title="Close"
+        ></button>
+      </div>
+    </header>
+
+    <main class="content">
+      <label class="content-label" for="window-select">Process to be on top</label>
+
+      <div class="select-wrapper" id="select-wrapper">
+        <select id="window-select" aria-label="Select a window to keep on top" disabled>
+          <option value="" selected>Loading windows…</option>
+        </select>
+        <span class="select-chevron" aria-hidden="true"></span>
+      </div>
+
+      <div class="actions">
+        <button id="btn-apply" class="pill-btn btn-apply" type="button" disabled>
+          Apply
+        </button>
+        <button id="btn-remove" class="pill-btn btn-remove" type="button" disabled>
+          Remove
+        </button>
+      </div>
+
+      <p id="status-text" class="status-text" role="status" aria-live="polite">
+        Loading windows…
+      </p>
+    </main>
+
+    <div id="toast-container" class="toast-container" aria-live="assertive"></div>
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

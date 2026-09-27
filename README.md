@@ -1,42 +1,526 @@
-<div align="center">
-  <picture>
-    <!-- Dark mode image -->
-    <source media="(prefers-color-scheme: dark)" srcset="alwaysontop.png">
-    <!-- Light mode image (fallback) -->
-    <img src="alwaysontop.png" alt="Description of the image" width="600">
-  </picture>
-</div>
+# AlwaysOnTop
 
-<p align="center">
-  <a href="" target="_blank">
-    <img src="https://img.shields.io/badge/platform-windows-blue?style=for-the-badge" alt="idk" />
-  </a>
-  <a href="" target="_blank">
-    <img src="https://img.shields.io/badge/license-mit-yellow?style=for-the-badge" alt="license" />
-  </a>
-</p>
+A small, modern Windows desktop utility for pinning any visible window
+"always on top" — pick a window from the dropdown, hit **Apply**, and it
+stays above everything else until you hit **Remove**.
 
-> A fast, Python utility to force active windows to always stay on top without breaking active application sessions.
-
-> [!IMPORTANT]
-> AlwaysOnTop is an **open-source hobby project.**
-> The NSIS app installer IS NOT SIGNED.
-> **This does not mean the warning should be ignored blindly.**
-> If you are uncomfortable running the batch installer, you can inspect the source code and run AlwaysOnTop directly
+- **Shell/UI:** Go + [Wails v2](https://wails.io) (native window, WebView2
+  renderer — not a browser, not Electron), HTML/CSS/vanilla JS frontend.
+- **Window-management engine:** a separate Python process using
+  `pywin32` (Win32 API) and `psutil`, talking to Go over a JSON-lines
+  stdin/stdout pipe.
+- **Target platform:** Windows 10/11 only. (The Python engine and the
+  `windows` build-tagged Go files are Windows-specific by design — this
+  app has no meaningful cross-platform mode.)
 
 ---
 
-## 🚀 Installation
+## 1. Architecture
 
-1. Install the latest release from https://github.com/FakePancak3/alwaysontop/releases
-2. Run the NSIS installer to install AlwaysOnTop. Default path is ``./ProgramFiles/AlwaysOnTop``
+```
+┌─────────────────────────────┐        JSON lines over        ┌──────────────────────────────┐
+│   Go / Wails application    │ <----  stdin/stdout pipe ----> │   Python engine (child proc)  │
+│  - Native frameless window  │                                │  - window_manager.py:         │
+│  - HTML/CSS/JS frontend     │                                │    enumerate windows,         │
+│  - app.go: bound methods    │                                │    SetWindowPos TOPMOST       │
+│  - pyengine.go: process     │                                │  - ipc.py: request/response   │
+│    lifecycle + IPC client   │                                │  - engine.py: stdin/stdout     │
+└─────────────────────────────┘                                │    loop, logs to stderr       │
+                                                                 └──────────────────────────────┘
+```
+
+Why this split:
+
+- **Go/Wails owns the UI.** Wails renders the frontend in the OS's native
+  WebView2 control — there is no bundled Chromium (unlike Electron) and
+  no local HTTP server serving the UI. The window itself is a normal
+  native Win32 window (frameless, with a custom title bar drawn in
+  HTML/CSS).
+- **Python owns all window management**, per the requirement that the
+  main window-management engine be Python. `window_manager.py` contains
+  every Win32 call (`EnumWindows`, `SetWindowPos`, `GetWindowThreadProcessId`,
+  etc.) and is fully isolated from the IPC transport, which makes it
+  unit-testable with plain mocks (see `backend/tests/`).
+- **The two talk over stdin/stdout**, not sockets or HTTP — simpler,
+  no ports to manage, no firewall prompts, and trivially sandboxable.
+  Go spawns the Python engine as a child process on startup and restarts
+  it automatically if it ever crashes.
+- **The Python engine ships embedded inside `AlwaysOnTop.exe`**, not as
+  a separate sibling file. `build.bat` packages it into a standalone
+  `AlwaysOnTopEngine.exe` with PyInstaller, and the production Wails
+  build (`-tags production`) bakes those bytes directly into the Go
+  binary via `//go:embed`. At first run, the app writes that embedded
+  copy out to `%AppData%\AlwaysOnTop\backend\AlwaysOnTopEngine.exe` and
+  runs it from there — never next to the installed `.exe` itself, which
+  may sit in `Program Files` where a normal user account can't write.
+  This is what makes the final app both a single self-contained
+  executable *and* keep all of its runtime files in the conventional
+  per-user location. In development (`wails dev`, no `-tags production`),
+  nothing is embedded and the engine runs straight from
+  `backend/engine.py` with a local Python interpreter instead, so
+  source edits take effect immediately without a PyInstaller rebuild.
+
+### Project layout
+
+```
+AlwaysOnTop/
+├── frontend/
+│   ├── index.html          # Custom title bar + main UI markup
+│   ├── src/
+│   │   ├── main.js         # Polling, dropdown sync, apply/remove, toasts
+│   │   └── styles.css      # Dark theme, CSS variables, animations
+│   └── wailsjs/             # AUTO-GENERATED by `wails dev`/`wails build` - do not hand-edit
+│
+├── backend/
+│   ├── engine.py            # Process entry point: stdin/stdout loop
+│   ├── ipc.py                # JSON-lines protocol parsing/dispatch
+│   ├── window_manager.py     # All Win32 calls live here, fully isolated
+│   ├── requirements.txt
+│   └── tests/
+│       └── test_window_manager.py
+│
+├── main.go                  # Wails app bootstrap, window options
+├── app.go                   # App struct: methods bound to the frontend
+├── pyengine.go               # Python child-process + IPC client (cross-platform code)
+├── pyengine_embed_prod.go     # Production builds only: embeds the packaged engine .exe
+├── pyengine_embed_dev.go      # Dev builds only: nothing embedded, uses local Python
+├── pyengine_extract.go        # Extracts the embedded engine to %AppData% at runtime
+├── pyengine_windows.go        # Windows-only: hides the engine's console window
+├── pyengine_other.go          # No-op stand-ins so the repo still builds/lints elsewhere
+├── go.mod
+├── wails.json
+├── build.bat                 # One-shot production build (PyInstaller + wails build [+ NSIS installer])
+└── README.md
+```
 
 ---
 
-## 🔨 Build from source
+## 2. Requirements
 
-``git clone https://github.com/summersalestart/alwaysontop``
-``Run build.bat``
-``Final build will be available in ./build/bin``
+- **Windows 10 or 11** (development and running the built app).
+- **Go** 1.21+
+- **Wails CLI v2**: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+- **Python** 3.10+ (only needed for development; the production build
+  bundles a packaged engine so end users don't need Python at all).
+- **WebView2 runtime** — preinstalled on current Windows 10/11; Wails
+  will prompt to install it if missing.
 
-**(Yes, i used the default wails icon as the app icon cuz im too lazy to make a entirely new icon)**
+---
+
+## 3. Development setup
+
+### 3.1 Install Go dependencies
+
+```bat
+go mod tidy
+```
+
+This pulls in `github.com/wailsapp/wails/v2` per `go.mod`.
+
+### 3.2 Install Python dependencies
+
+```bat
+cd backend
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+cd ..
+```
+
+A virtual environment is optional in development but recommended.
+
+### 3.3 Running the development version
+
+From the project root:
+
+```bat
+wails dev
+```
+
+The first run generates `frontend/wailsjs/` (the JS bindings for every
+exported method on `App`) by reflecting over `app.go` — this is why that
+folder isn't checked in by hand and why `main.js` can `import` from it.
+
+In dev mode, `pyengine.go`'s `resolveEngineCommand()` falls back to
+running `python backend/engine.py` directly (it looks for `python`,
+then `python3`, on `PATH`), so make sure your virtual environment (or
+system Python with `requirements.txt` installed) is active in the shell
+you launch `wails dev` from.
+
+---
+
+## 4. Building the Python backend (standalone)
+
+To package the engine into a single Windows executable so it doesn't
+need a Python install on the target machine:
+
+```bat
+cd backend
+python -m pip install pyinstaller
+python -m PyInstaller --onefile --noconsole --name AlwaysOnTopEngine --distpath embedded engine.py
+cd ..
+```
+
+Note the `python -m PyInstaller` form rather than a bare `pyinstaller`
+command: `pip` installs `pyinstaller.exe` into Python's `Scripts\`
+folder, which is often *not* on `PATH` even when `python` itself is.
+Running it as a module through the interpreter you already have on
+`PATH` sidesteps that "pyinstaller is not recognized" error entirely.
+
+This produces `backend/embedded/AlwaysOnTopEngine.exe` — the exact path
+`pyengine_embed_prod.go`'s `//go:embed` directive reads from, so it
+**must** exist there before the production Go build in the next step.
+`--noconsole` combined with `CREATE_NO_WINDOW` on the Go side (see
+`pyengine_windows.go`) ensures no console window ever flashes up.
+
+---
+
+## 5. Building the Wails application
+
+```bat
+wails build -tags production
+```
+
+The `-tags production` flag is what selects `pyengine_embed_prod.go`
+(which embeds `backend/embedded/AlwaysOnTopEngine.exe` into the binary)
+over `pyengine_embed_dev.go` (which embeds nothing and expects a local
+Python interpreter). **Omitting the tag produces a dev-mode binary that
+won't run standalone on another machine** — always include it for a
+build you intend to distribute, or just use `build.bat`, which always
+gets this right.
+
+Output goes to `build/bin/AlwaysOnTop.exe`. Because the Python engine
+is embedded, that single file is fully self-contained — copying it
+alone to a clean Windows 10/11 machine is enough to run the app; no
+Python install and no accompanying `backend\` folder are required.
+
+---
+
+## 6. Creating a distributable Windows build
+
+The included `build.bat` does steps 4 and 5 together, and additionally
+builds a proper NSIS installer if NSIS is available:
+
+```bat
+build.bat
+```
+
+This produces, in `build/bin/`:
+
+- **`AlwaysOnTop.exe`** — always produced. Fully self-contained; can be
+  copied and run directly on any Windows 10/11 machine with no
+  installation step.
+- **`AlwaysOnTop-amd64-installer.exe`** — produced only if NSIS's
+  `makensis` is on `PATH`. A proper Windows installer: installs the app,
+  adds a Start Menu entry, and registers an uninstaller in "Add or
+  Remove Programs".
+
+To get the installer, install NSIS first:
+
+```bat
+winget install NSIS.NSIS
+```
+
+(or via Scoop/Chocolatey — see the
+[Wails NSIS guide](https://wails.io/docs/guides/windows-installer)),
+make sure the `Bin` folder containing `makensis.exe` is on `PATH`, open
+a new terminal, and run `build.bat` again. The first time this runs, the
+Wails CLI auto-generates `build/windows/installer/project.nsi` from a
+template populated with the `info` block in `wails.json` (product name,
+company, version) — feel free to customize that file afterwards (e.g.
+add a license page or custom icon); Wails won't overwrite it once it
+exists.
+
+Whichever way it's installed or run, the app extracts its embedded
+engine to `%AppData%\AlwaysOnTop\backend\AlwaysOnTopEngine.exe` on
+first launch and re-uses it on subsequent launches (it only re-extracts
+if the embedded copy's hash changes, e.g. after an update) — so no
+runtime files ever need to live next to the installed `.exe` itself.
+
+---
+
+## 7. Architecture: IPC protocol
+
+Before any of this: **where the engine itself comes from** each time
+the app starts is decided by `resolveEngineCommand()` in `pyengine.go`,
+in this order:
+
+1. `ALWAYSONTOP_PY_ENGINE` environment variable, if set — an explicit
+   override, useful for custom deployments or debugging.
+2. The embedded, PyInstaller-packaged engine (production builds only),
+   extracted to `%AppData%\AlwaysOnTop\backend\AlwaysOnTopEngine.exe`
+   the first time it's needed (see §1 and §6 above).
+3. A manually placed `AlwaysOnTopEngine.exe` next to the running `.exe`,
+   for anyone deploying by hand without the embedded copy.
+4. Local `python`/`python3` on `PATH` running `backend/engine.py`
+   directly — the development fallback.
+
+Once a process is running, the transport is **JSON Lines** over its
+stdin/stdout:
+
+- Exactly one JSON object per line in both directions.
+- `stdout` on the Python side carries *only* protocol JSON — nothing
+  else is ever printed there. All logs and errors go to `stderr`,
+  which Go forwards into its own log output.
+- Every request Go sends includes a numeric `"id"`; the matching
+  response echoes it back, so concurrent calls (e.g. a background
+  refresh overlapping a user's Apply click) can be correlated
+  correctly and never get mixed up.
+- Malformed input, unknown actions, and internal exceptions are all
+  converted into `{"success": false, "error": "..."}` responses — the
+  engine process itself never crashes or exits because of a bad
+  request, and Go additionally restarts it automatically if it ever
+  does exit unexpectedly.
+
+### Actions
+
+**List windows**
+
+```json
+// request
+{"action": "list_windows", "id": 1}
+
+// response
+{
+  "success": true,
+  "id": 1,
+  "windows": [
+    {"hwnd": 123456, "title": "Google Chrome", "pid": 4821, "process_name": "chrome.exe", "topmost": false},
+    {"hwnd": 789012, "title": "index.html - Visual Studio Code", "pid": 5140, "process_name": "Code.exe", "topmost": true}
+  ]
+}
+```
+
+**Apply always-on-top**
+
+```json
+{"action": "set_topmost", "id": 2, "hwnd": 123456, "value": true}
+// -> {"success": true, "id": 2, "hwnd": 123456, "topmost": true}
+```
+
+**Remove always-on-top**
+
+```json
+{"action": "set_topmost", "id": 3, "hwnd": 123456, "value": false}
+// -> {"success": true, "id": 3, "hwnd": 123456, "topmost": false}
+```
+
+**Error example** (stale/closed window)
+
+```json
+{"success": false, "id": 4, "error": "Window 123456 is no longer available."}
+```
+
+---
+
+## 8. How the TOPMOST functionality works
+
+Always-on-top is a property of a **window** (an `HWND`), not a process —
+a single process (e.g. Chrome) can own many top-level windows, and only
+one of them is the one the user actually wants pinned. `window_manager.py`
+therefore:
+
+1. **Enumerates real windows**, not processes, via `EnumWindows`. Each
+   candidate is filtered through `IsWindowVisible`, its extended style
+   bits (`GWL_EXSTYLE`), and its owner window, to approximate the same
+   "does this look like something a user would Alt+Tab to" heuristic
+   Windows itself uses — this filters out shell chrome (`Progman`,
+   `Shell_TrayWnd`), floating tool palettes, and windows with no title.
+2. **Resolves the owning process** for each window via
+   `GetWindowThreadProcessId`, then looks up its executable name with
+   `psutil` (falling back to `QueryFullProcessImageName` via `ctypes`/
+   `pywin32` if `psutil` can't access it).
+3. **Reads current topmost state** by checking the `WS_EX_TOPMOST` bit
+   in the window's extended style.
+4. **Applies/removes topmost** with
+   `SetWindowPos(hwnd, HWND_TOPMOST | HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` —
+   the `SWP_NO*` flags mean this call only changes z-order, never moves,
+   resizes, or steals focus from the target window.
+5. **Re-reads the state after the call** rather than trusting it blindly,
+   because some protected/system windows silently ignore z-order changes.
+6. **Handles windows disappearing mid-operation**: every call first
+   checks `IsWindow(hwnd)`; if the window closed between being listed
+   and being acted on, a clear `WindowManagerError` is raised and
+   surfaced to the UI as a toast instead of crashing anything.
+
+---
+
+## 9. UI behavior notes
+
+- The dropdown refreshes every 4 seconds; the currently selected `HWND`
+  is preserved across refreshes by matching handles, not list positions.
+- If the selected window closes, it's quietly dropped from the list and
+  the user sees a small toast rather than a broken selection.
+- Apply is disabled once a window is already topmost; Remove is
+  disabled once it isn't — so button state itself reflects current
+  state, not just "something is selected" (state is also shown via the
+  status line, so this isn't conveyed by color alone).
+- All errors surface as small toast notifications; native Windows
+  message boxes are never used except for truly fatal startup failures
+  (e.g. the Python engine can't be found at all).
+
+---
+
+## 10. Testing
+
+The Python engine's core logic is isolated from the IPC transport
+specifically so it's testable without a live pipe or a real Windows
+session:
+
+```bat
+cd backend
+python -m pip install pytest
+python -m pytest tests/ -v
+```
+
+The tests mock `win32gui` / `win32process` / `win32con` directly and
+verify:
+
+- real visible windows are returned with correct fields,
+- empty-title, shell, and tool windows are filtered out (unless they
+  carry `WS_EX_APPWINDOW`),
+- topmost state is read correctly from `GWL_EXSTYLE`,
+- a single flaky/vanished window during enumeration doesn't abort the
+  whole scan,
+- `set_topmost` calls `SetWindowPos` with the correct `HWND_TOPMOST` /
+  `HWND_NOTOPMOST` sentinel and raises `WindowManagerError` for stale
+  handles or Win32 failures.
+
+---
+
+## 11. Manual verification checklist
+
+Before shipping a build, verify on a real Windows 10/11 machine:
+
+1. App launches with the dark, square-cornered, frameless window (title
+   bar and controls are custom-drawn; the pill-shaped dropdown and
+   Apply/Remove buttons remain rounded).
+2. Window list populates within a second or two of launch.
+3. Selecting a window in the dropdown enables Apply.
+4. Apply actually raises the selected window above all others.
+5. Remove actually drops it back to normal z-order.
+6. Closing the currently-selected target window does not crash the app
+   (it disappears from the list with a toast instead).
+7. Refreshing (every 4s) never resets your current selection.
+8. Dragging the custom title bar moves the window.
+9. The yellow button minimizes the app.
+10. The red button closes the app.
+11. Visually matches the reference design (dark, centered content,
+    pill-shaped dropdown/buttons; square window frame).
+12. No console window ever appears, in a `build.bat`-produced build.
+13. `%AppData%\AlwaysOnTop\backend\AlwaysOnTopEngine.exe` appears after
+    first launch, and nothing is required next to the installed
+    `AlwaysOnTop.exe` itself for the app to run.
+14. If a `-nsis` installer was built: installing, launching from the
+    Start Menu, and then uninstalling via "Add or Remove Programs" all
+    work cleanly.
+
+---
+
+## 12. Where the app keeps its files (%APPDATA%)
+
+The install directory (wherever `AlwaysOnTop.exe` and its bundled
+`backend\AlwaysOnTopEngine.exe` actually live - e.g. `Program Files`) is
+treated as **read-only**: nothing is ever written there at runtime. On
+every launch, the app makes sure everything it needs is available at:
+
+```
+%APPDATA%\AlwaysOnTop\
+├── backend\
+│   └── AlwaysOnTopEngine.exe   ← copied here from the install dir on first run
+└── logs\
+    └── app.log                 ← Go + Python engine logs, appended across runs
+```
+
+This happens in `appdata.go`:
+
+- `setupLogging()` redirects Go's standard logger to
+  `%APPDATA%\AlwaysOnTop\logs\app.log` before anything else starts, so
+  there's somewhere to look even in a production build with no console
+  window. (The Python engine's own stderr is forwarded into this same
+  log via `pyengine.go`'s `readStderr`.)
+- `relocateEngineToAppData()` is called from `resolveEngineCommand()`
+  the first time a bundled `backend\AlwaysOnTopEngine.exe` is found
+  next to the running `.exe`: it copies that binary into
+  `%APPDATA%\AlwaysOnTop\backend\` (skipping the copy on subsequent
+  launches if the size/timestamp already match) and the app always
+  spawns the engine from that copy, never from the install directory
+  directly.
+
+If you ever want to force a clean re-copy (e.g. after shipping an
+updated engine build), just delete `%APPDATA%\AlwaysOnTop\` entirely -
+it will be recreated and repopulated on the next launch.
+
+In **development** mode (no bundled `AlwaysOnTopEngine.exe` found next
+to the running binary - i.e. running via `wails dev`), this relocation
+step is skipped and the engine runs directly via `python backend/engine.py`
+as described in §3.3; there's nothing bundled to relocate yet.
+
+---
+
+## 13. Packaging as an installer (optional)
+
+`build.bat` produces a portable folder (`build/bin/`) that already runs
+standalone - no installer is required to use the app. If you'd like a
+proper Windows installer (Start Menu entry, `Add or Remove Programs`
+listing, uninstaller) instead of handing out a folder, Wails has
+built-in support for generating one with NSIS.
+
+1. **Install NSIS** (only needed on the machine that builds the
+   installer, not on end users' machines):
+
+   ```bat
+   winget install NSIS.NSIS --silent
+   ```
+
+   Make sure the folder containing `makensis.exe` ends up on `PATH`
+   (the winget package usually handles this; verify with
+   `where makensis` in a new Command Prompt).
+
+2. **Run `build.bat` first**, as normal, so `build/bin/AlwaysOnTop.exe`
+   and `build/bin/backend/AlwaysOnTopEngine.exe` both exist.
+
+3. **Generate the installer:**
+
+   ```bat
+   wails build -nsis
+   ```
+
+   The first time this runs, Wails writes a default, editable NSIS
+   script to `build/windows/installer/project.nsi` (and never
+   overwrites it again once it exists, so any customization you make
+   is safe across future builds). The resulting installer `.exe` is
+   placed in `build/bin/`.
+
+4. **Bundle the backend folder into the installer.** Wails' default
+   template only packages the main application binary - it doesn't
+   know about `backend/AlwaysOnTopEngine.exe` unless you tell it to.
+   Open `build/windows/installer/project.nsi`, find the install
+   section (`Section "MainSection" ...` ... `SectionEnd`, right after
+   the line that installs the main `.exe`), and add:
+
+   ```nsis
+   SetOutPath "$INSTDIR\backend"
+   File /r "..\..\bin\backend\*.*"
+   SetOutPath "$INSTDIR"
+   ```
+
+   Then find the uninstall section (`Section "uninstall" ...`) and add
+   a matching cleanup line so the uninstaller removes it too:
+
+   ```nsis
+   RMDir /r "$INSTDIR\backend"
+   ```
+
+   Re-run `wails build -nsis` (without `-clean`, so it doesn't wipe the
+   `backend/` folder `build.bat` placed in `build/bin/`) to produce the
+   final installer with the engine bundled.
+
+5. Optionally fill in `Info` in `wails.json` (`companyName`,
+   `productName`, `productVersion`, `copyright`, `comments`) - NSIS
+   reads these for the installer's metadata and `Add or Remove
+   Programs` entry.
+
+Whether users get the installer or the plain `build/bin/` folder makes
+no difference to where the app keeps its files at runtime - §12's
+`%APPDATA%` relocation happens identically either way.
