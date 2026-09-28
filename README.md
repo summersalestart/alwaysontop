@@ -36,7 +36,9 @@
 ## 🔨 Build from source
 
 ``git clone https://github.com/summersalestart/alwaysontop``
+
 ``Run build.bat``
+
 ``Final build will be available in ./build/bin``
 
 **(Yes, i used the default wails icon as the app icon cuz im too lazy to make a entirely new icon)**
